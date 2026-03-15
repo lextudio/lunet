@@ -13,6 +13,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using Scriban.Functions;
 using Zio;
@@ -95,6 +96,7 @@ public class ApiDotNetProcessor : ProcessorBase<ApiDotNetPlugin>
         }
 
         GeneratePages();
+        GenerateMystFiles();
     }
 
     private void GeneratePages()
@@ -208,6 +210,349 @@ public class ApiDotNetProcessor : ProcessorBase<ApiDotNetPlugin>
 
         ConfigureGeneratedMenu(apiRootPage, pagesByUid);
     }
+
+    // ── MyST output ──────────────────────────────────────────────────────────
+
+    private void GenerateMystFiles()
+    {
+        var mystOutputPathConfig = Config.MystOutputPath;
+        if (string.IsNullOrWhiteSpace(mystOutputPathConfig))
+            return;
+
+        var rootDirectory = Site.SiteFileSystem.ConvertPathToInternal(UPath.Root);
+        var outputDir = Path.GetFullPath(Path.Combine(rootDirectory, mystOutputPathConfig));
+        Directory.CreateDirectory(outputDir);
+
+        var helpers = new ApiDotNetTemplateHelpers(Site, Config);
+        var slugResolver = new ApiDotNetSlugResolver(Config.MaxSlugLength);
+
+        var nsSlugs = new List<string>();
+        var typeSlugs = new List<string>();
+
+        foreach (var pair in ApiDotNetObject.Objects)
+        {
+            var obj = (ScriptObject)pair.Value;
+            var uid = obj.GetSafeValue<string>("uid");
+            if (string.IsNullOrWhiteSpace(uid)) continue;
+
+            var kind = GetTypeFromModel(obj);
+            var slug = slugResolver.GetSlug(uid);
+
+            string content;
+            switch (kind)
+            {
+                case "Namespace":
+                    content = BuildNamespaceMyst(obj, helpers, slugResolver);
+                    nsSlugs.Add(slug);
+                    break;
+                case "Class":
+                case "Struct":
+                case "Interface":
+                case "Enum":
+                case "Delegate":
+                    content = BuildTypeMyst(obj, kind!, helpers, slugResolver);
+                    typeSlugs.Add(slug);
+                    break;
+                default:
+                    // Members are rendered inline on the type page; skip separate files.
+                    continue;
+            }
+
+            File.WriteAllText(Path.Combine(outputDir, slug + ".md"), content, Encoding.UTF8);
+        }
+
+        File.WriteAllText(
+            Path.Combine(outputDir, "index.md"),
+            BuildApiRootIndexMyst(nsSlugs, typeSlugs),
+            Encoding.UTF8);
+
+        Site.Info($"MyST API output: {outputDir} ({nsSlugs.Count} namespaces, {typeSlugs.Count} types)");
+    }
+
+    private string BuildApiRootIndexMyst(List<string> nsSlugs, List<string> typeSlugs)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# API Reference");
+        sb.AppendLine();
+        sb.AppendLine("```{toctree}");
+        sb.AppendLine(":hidden:");
+        sb.AppendLine(":maxdepth: 1");
+        sb.AppendLine();
+        foreach (var s in nsSlugs.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            sb.AppendLine(s);
+        foreach (var s in typeSlugs.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            sb.AppendLine(s);
+        sb.AppendLine("```");
+        sb.AppendLine();
+        sb.AppendLine("## Namespaces");
+        sb.AppendLine();
+
+        var slugResolver = new ApiDotNetSlugResolver(Config.MaxSlugLength);
+        foreach (var ns in ApiDotNetObject.Namespaces.OrderBy(n => n.GetSafeValue<string>("name"), StringComparer.OrdinalIgnoreCase))
+        {
+            var uid = ns.GetSafeValue<string>("uid") ?? "";
+            var name = ns.GetSafeValue<string>("name") ?? uid;
+            var slug = slugResolver.GetSlug(uid);
+            var summary = MystFirstSentence(MystResolveSummary(ns.GetSafeValue<string>("summary"), new ApiDotNetTemplateHelpers(Site, Config)));
+            sb.Append($"- [{EscapeMystText(name)}]({slug}.md)");
+            if (!string.IsNullOrWhiteSpace(summary))
+                sb.Append($" — {summary}");
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private string BuildNamespaceMyst(ScriptObject ns, ApiDotNetTemplateHelpers helpers, ApiDotNetSlugResolver slugResolver)
+    {
+        var sb = new StringBuilder();
+        var uid = ns.GetSafeValue<string>("uid") ?? "";
+        var name = ns.GetSafeValue<string>("name") ?? uid;
+        var summary = MystResolveSummary(ns.GetSafeValue<string>("summary"), helpers);
+
+        WriteMystPageHeader(sb, uid, $"{name} Namespace");
+
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            sb.AppendLine(summary);
+            sb.AppendLine();
+        }
+
+        AppendMystTypeTable(sb, ns, "classes",    "Classes",    helpers, slugResolver);
+        AppendMystTypeTable(sb, ns, "structs",    "Structs",    helpers, slugResolver);
+        AppendMystTypeTable(sb, ns, "interfaces", "Interfaces", helpers, slugResolver);
+        AppendMystTypeTable(sb, ns, "enums",      "Enums",      helpers, slugResolver);
+        AppendMystTypeTable(sb, ns, "delegates",  "Delegates",  helpers, slugResolver);
+
+        return sb.ToString();
+    }
+
+    private void AppendMystTypeTable(
+        StringBuilder sb,
+        ScriptObject parent,
+        string key,
+        string heading,
+        ApiDotNetTemplateHelpers helpers,
+        ApiDotNetSlugResolver slugResolver)
+    {
+        var members = parent.GetSafeValue<ScriptObjectCollection>(key);
+        if (members == null || members.Count == 0) return;
+
+        sb.AppendLine($"## {heading}");
+        sb.AppendLine();
+        sb.AppendLine("| Name | Description |");
+        sb.AppendLine("|------|-------------|");
+
+        foreach (var m in members.OrderBy(m => m.GetSafeValue<string>("name"), StringComparer.OrdinalIgnoreCase))
+        {
+            var mUid  = m.GetSafeValue<string>("uid") ?? "";
+            var mName = m.GetSafeValue<string>("name") ?? mUid;
+            var mSlug = slugResolver.GetSlug(mUid);
+            var mSummary = EscapeMystTableCell(MystFirstSentence(MystResolveSummary(m.GetSafeValue<string>("summary"), helpers)));
+            sb.AppendLine($"| [{EscapeMystTableCell(mName)}]({mSlug}.md) | {mSummary} |");
+        }
+        sb.AppendLine();
+    }
+
+    private string BuildTypeMyst(ScriptObject type, string kind, ApiDotNetTemplateHelpers helpers, ApiDotNetSlugResolver slugResolver)
+    {
+        var sb = new StringBuilder();
+        var uid        = type.GetSafeValue<string>("uid") ?? "";
+        var name       = type.GetSafeValue<string>("name") ?? uid;
+        var ns         = type.GetSafeValue<string>("namespace") ?? "";
+        var assemblies = type.GetSafeValue<ScriptArray>("assemblies");
+        var summary    = MystResolveSummary(type.GetSafeValue<string>("summary"), helpers);
+        var remarks    = MystResolveSummary(type.GetSafeValue<string>("remarks"), helpers);
+
+        WriteMystPageHeader(sb, uid, $"{name} {kind}");
+
+        if (!string.IsNullOrWhiteSpace(ns))
+            sb.AppendLine($"**Namespace:** `{ns}`  ");
+        if (assemblies != null && assemblies.Count > 0)
+            sb.AppendLine($"**Assembly:** `{string.Join(", ", assemblies.OfType<object>().Select(a => a.ToString()))}`");
+        sb.AppendLine();
+
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            sb.AppendLine(summary);
+            sb.AppendLine();
+        }
+
+        WriteMystSyntaxBlock(sb, type, helpers);
+
+        if (!string.IsNullOrWhiteSpace(remarks))
+        {
+            sb.AppendLine("## Remarks");
+            sb.AppendLine();
+            sb.AppendLine(remarks);
+            sb.AppendLine();
+        }
+
+        AppendMystMemberSection(sb, type, "constructors",   "Constructors",   helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "fields",         "Fields",         helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "properties",     "Properties",     helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "methods",        "Methods",        helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "events",         "Events",         helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "operators",      "Operators",      helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "extensions",     "Extension Methods", helpers, slugResolver);
+        AppendMystMemberSection(sb, type, "explicit_interface_implementation_methods",
+                                "Explicit Interface Implementation Methods", helpers, slugResolver);
+
+        return sb.ToString();
+    }
+
+    private void AppendMystMemberSection(
+        StringBuilder sb,
+        ScriptObject parent,
+        string key,
+        string heading,
+        ApiDotNetTemplateHelpers helpers,
+        ApiDotNetSlugResolver slugResolver)
+    {
+        var members = parent.GetSafeValue<ScriptObjectCollection>(key);
+        if (members == null || members.Count == 0) return;
+
+        sb.AppendLine($"## {heading}");
+        sb.AppendLine();
+
+        foreach (var m in members)
+        {
+            var mUid  = m.GetSafeValue<string>("uid") ?? "";
+            var mName = m.GetSafeValue<string>("name") ?? mUid;
+            var mSummary = MystResolveSummary(m.GetSafeValue<string>("summary"), helpers);
+            var mRemarks = MystResolveSummary(m.GetSafeValue<string>("remarks"), helpers);
+
+            sb.AppendLine($"### {EscapeMystText(mName)}");
+            sb.AppendLine();
+
+            if (!string.IsNullOrWhiteSpace(mSummary))
+            {
+                sb.AppendLine(mSummary);
+                sb.AppendLine();
+            }
+
+            // Syntax block
+            var syntax = m.GetSafeValue<ScriptObject>("syntax");
+            if (syntax != null)
+            {
+                var content = syntax.GetSafeValue<string>("content");
+                if (!string.IsNullOrWhiteSpace(content))
+                {
+                    sb.AppendLine("```csharp");
+                    sb.AppendLine(content.Trim());
+                    sb.AppendLine("```");
+                    sb.AppendLine();
+                }
+
+                // Parameters
+                var parameters = syntax.GetSafeValue<ScriptArray>("parameters");
+                if (parameters != null && parameters.Count > 0)
+                {
+                    sb.AppendLine("**Parameters**");
+                    sb.AppendLine();
+                    foreach (var p in parameters.OfType<ScriptObject>())
+                    {
+                        var pId   = p.GetSafeValue<string>("id") ?? "";
+                        var pType = p.GetSafeValue<string>("type") ?? "";
+                        var pDesc = MystResolveSummary(p.GetSafeValue<string>("description"), helpers);
+                        sb.Append($"- `{pId}`");
+                        if (!string.IsNullOrWhiteSpace(pType))
+                            sb.Append($" ({EscapeMystText(pType)})");
+                        if (!string.IsNullOrWhiteSpace(pDesc))
+                            sb.Append($" — {pDesc}");
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine();
+                }
+
+                // Return value
+                var ret = syntax.GetSafeValue<ScriptObject>("return");
+                if (ret != null)
+                {
+                    var rType = ret.GetSafeValue<string>("type") ?? "";
+                    var rDesc = MystResolveSummary(ret.GetSafeValue<string>("description"), helpers);
+                    if (!string.IsNullOrWhiteSpace(rType) || !string.IsNullOrWhiteSpace(rDesc))
+                    {
+                        sb.AppendLine("**Returns**");
+                        sb.AppendLine();
+                        if (!string.IsNullOrWhiteSpace(rType))
+                            sb.Append($"`{EscapeMystText(rType)}`");
+                        if (!string.IsNullOrWhiteSpace(rDesc))
+                            sb.Append(string.IsNullOrWhiteSpace(rType) ? rDesc : $" — {rDesc}");
+                        sb.AppendLine();
+                        sb.AppendLine();
+                    }
+                }
+            }
+
+            // Source link
+            var sourceUrl = helpers.ApiDotNetSourceUrl(m.GetSafeValue<ScriptObject>("source"));
+            if (!string.IsNullOrWhiteSpace(sourceUrl))
+            {
+                sb.AppendLine($"[View source]({sourceUrl})");
+                sb.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(mRemarks))
+            {
+                sb.AppendLine(mRemarks);
+                sb.AppendLine();
+            }
+        }
+    }
+
+    private static void WriteMystPageHeader(StringBuilder sb, string uid, string title)
+    {
+        // YAML front matter
+        sb.AppendLine("---");
+        sb.AppendLine($"uid: '{uid.Replace("'", "''")}'");
+        sb.AppendLine($"title: {title}");
+        sb.AppendLine("---");
+        sb.AppendLine();
+        // H1
+        sb.AppendLine($"# {EscapeMystText(title)}");
+        sb.AppendLine();
+    }
+
+    private static void WriteMystSyntaxBlock(StringBuilder sb, ScriptObject obj, ApiDotNetTemplateHelpers helpers)
+    {
+        var syntax = obj.GetSafeValue<ScriptObject>("syntax");
+        if (syntax == null) return;
+
+        var content = syntax.GetSafeValue<string>("content");
+        if (!string.IsNullOrWhiteSpace(content))
+        {
+            sb.AppendLine("## Syntax");
+            sb.AppendLine();
+            sb.AppendLine("```csharp");
+            sb.AppendLine(content.Trim());
+            sb.AppendLine("```");
+            sb.AppendLine();
+        }
+
+        var sourceUrl = helpers.ApiDotNetSourceUrl(obj.GetSafeValue<ScriptObject>("source"));
+        if (!string.IsNullOrWhiteSpace(sourceUrl))
+        {
+            sb.AppendLine($"[View source on GitHub]({sourceUrl})");
+            sb.AppendLine();
+        }
+    }
+
+    private static string MystResolveSummary(string? text, ApiDotNetTemplateHelpers helpers)
+        => string.IsNullOrWhiteSpace(text) ? string.Empty : helpers.ApiDotNetResolveXrefsMyst(text.Trim());
+
+    private static string MystFirstSentence(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        var idx = text.IndexOfAny(['.', '!', '?']);
+        return idx >= 0 ? text[..(idx + 1)] : text;
+    }
+
+    private static string EscapeMystText(string text)
+        => text.Replace("`", "\\`");
+
+    private static string EscapeMystTableCell(string text)
+        => text.Replace("|", "\\|").Replace("\r", "").Replace("\n", " ");
 
     private DynamicContentObject CreateApiContentPage(string url)
     {

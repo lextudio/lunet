@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using Lunet.Core;
 using Scriban.Functions;
 using Scriban.Runtime;
@@ -37,6 +38,7 @@ internal sealed class ApiDotNetTemplateHelpers
 
         target.Import("xref_to_html_link", (Func<string?, bool, bool, string>)XRefToHtmlLink);
         target.Import("api_dotnet_resolve_xrefs", (Func<string?, bool, string>)ApiDotNetResolveXrefs);
+        target.Import("api_dotnet_resolve_xrefs_myst", (Func<string?, string>)ApiDotNetResolveXrefsMyst);
         target.Import("api_dotnet_xref_attr", (Func<string?, string?, string>)ApiDotNetXRefAttr);
         target.Import("api_dotnet_handleize", (Func<string?, string>)ApiDotNetHandleize);
         target.Import("api_dotnet_repo_to_https_url", (Func<string?, string>)ApiDotNetRepoToHttpsUrl);
@@ -417,6 +419,60 @@ internal sealed class ApiDotNetTemplateHelpers
 
         builder.Append("</div>\n");
         return builder.ToString();
+    }
+
+    /// <summary>
+    /// Converts xref tags in API doc text to MyST inline code spans and strips HTML.
+    /// Suitable for use in generated MyST markdown files.
+    /// </summary>
+    public string ApiDotNetResolveXrefsMyst(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return string.Empty;
+
+        var result = text;
+
+        // <xref href="uid">display text</xref>  →  `display text`
+        result = Regex.Replace(result,
+            @"<xref\s+href=""([^""]+)""[^>]*>([^<]*)</xref>",
+            m =>
+            {
+                var display = m.Groups[2].Value.Trim();
+                return string.IsNullOrEmpty(display)
+                    ? $"`{GetShortUidName(m.Groups[1].Value)}`"
+                    : $"`{display}`";
+            });
+
+        // <xref href="uid" />  →  `ShortName`
+        result = Regex.Replace(result,
+            @"<xref\s+href=""([^""]+)""[^/]*/?>",
+            m => $"`{GetShortUidName(m.Groups[1].Value)}`");
+
+        // <xref uid="langword_true" name="true" />  →  `true`
+        result = Regex.Replace(result,
+            @"<xref\s[^>]*\bname=""([^""]+)""[^>]*/?>",
+            m => $"`{m.Groups[1].Value}`");
+
+        return StripHtmlForMyst(result);
+    }
+
+    private static string StripHtmlForMyst(string text)
+    {
+        // <code>…</code>  →  backtick span
+        text = Regex.Replace(text, @"<code>(.*?)</code>", "`$1`", RegexOptions.Singleline);
+        // paragraph tags
+        text = text.Replace("</p>", "\n\n", StringComparison.Ordinal)
+                   .Replace("<p>", string.Empty, StringComparison.Ordinal);
+        // strip remaining tags
+        text = Regex.Replace(text, @"<[^>]+>", string.Empty);
+        return text.Trim();
+    }
+
+    internal static string GetShortUidName(string uid)
+    {
+        if (string.IsNullOrEmpty(uid)) return uid;
+        var lastDot = uid.LastIndexOf('.');
+        return lastDot >= 0 && lastDot < uid.Length - 1 ? uid[(lastDot + 1)..] : uid;
     }
 
     private bool TryResolveXRef(string uid, bool useFullName, out string name, out string url)

@@ -104,4 +104,15 @@ public class ApiDotNetConfig : ApiConfig
         }
         set => this.SetValue("max_slug_length", value);
     }
+
+    /// <summary>
+    /// Filesystem path (relative to the docs root) where MyST markdown files are emitted
+    /// for Sphinx integration. Leave null or empty to skip MyST output.
+    /// Example: "../../sharpsnmp_docs/library/api/dotnet"
+    /// </summary>
+    public string? MystOutputPath
+    {
+        get => this.GetSafeValue<string>("myst_output_path");
+        set => this.SetValue("myst_output_path", value);
+    }
 }
